@@ -1,0 +1,433 @@
+// Package service owns the repository lifecycle: registering repos when they
+// are requested, the refresh queue and the workers that sync + analyze them.
+//
+// Queue policy (as agreed):
+//   - Requested repos that are new or stale go to the front queue (FIFO, deduplicated).
+//   - When the front queue is empty, workers cycle over all known repos,
+//     picking the one checked longest ago, if it was checked more than
+//     RefreshInterval ago.
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/holacloud/store"
+
+	"github.com/holacloud/clocme/githost"
+	"github.com/holacloud/clocme/model"
+	"github.com/holacloud/clocme/telegram"
+)
+
+// Analyzer is implemented by *analyzer.Analyzer.
+type Analyzer interface {
+	Sync(ctx context.Context, repoID, cloneURL, branch string) (head string, err error)
+	Analyze(ctx context.Context, repoID, head string, prev []model.Point, progress func(done, total int)) ([]model.Point, error)
+}
+
+// Host is implemented by *githost.Github.
+type Host interface {
+	Info(ctx context.Context, owner, name string) (*githost.RepoInfo, error)
+}
+
+type Options struct {
+	Workers         int
+	RefreshInterval time.Duration
+	AnalyzeTimeout  time.Duration
+	MaxRepoSizeKB   int64
+	BaseURL         string
+}
+
+type Progress struct {
+	Phase string `json:"phase"` // "sync" | "analyze"
+	Done  int    `json:"done"`
+	Total int    `json:"total"`
+}
+
+type Service struct {
+	repos    store.Storer[model.Repo]
+	series   store.Storer[model.Series]
+	analyzer Analyzer
+	host     Host
+	tg       *telegram.Telegram
+	opts     Options
+
+	updateMu sync.Mutex // serializes read-modify-write of repo documents
+
+	mu       sync.Mutex
+	queue    []string
+	queued   map[string]bool
+	working  map[string]bool
+	progress map[string]Progress
+	wake     chan struct{}
+}
+
+func New(repos store.Storer[model.Repo], series store.Storer[model.Series], a Analyzer, h Host, tg *telegram.Telegram, opts Options) *Service {
+	if opts.Workers < 1 {
+		opts.Workers = 1
+	}
+	if opts.RefreshInterval <= 0 {
+		opts.RefreshInterval = time.Hour
+	}
+	if opts.AnalyzeTimeout <= 0 {
+		opts.AnalyzeTimeout = 30 * time.Minute
+	}
+	return &Service{
+		repos:    repos,
+		series:   series,
+		analyzer: a,
+		host:     h,
+		tg:       tg,
+		opts:     opts,
+		queued:   map[string]bool{},
+		working:  map[string]bool{},
+		progress: map[string]Progress{},
+		wake:     make(chan struct{}, 1),
+	}
+}
+
+// Get returns the repo document or nil.
+func (s *Service) Get(ctx context.Context, id string) (*model.Repo, error) {
+	return s.repos.Get(ctx, id)
+}
+
+// Series returns the points of a repo (nil if none yet).
+func (s *Service) Series(ctx context.Context, id string) ([]model.Point, error) {
+	ser, err := s.series.Get(ctx, id)
+	if err != nil || ser == nil {
+		return nil, err
+	}
+	return ser.Points, nil
+}
+
+func (s *Service) Progress(id string) (Progress, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.progress[id]
+	return p, ok
+}
+
+// Recent returns the most recently updated ready repos.
+func (s *Service) Recent(ctx context.Context, n int) ([]*model.Repo, error) {
+	all, err := s.repos.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ready := all[:0]
+	for _, r := range all {
+		if r.Status == model.StatusReady {
+			ready = append(ready, r)
+		}
+	}
+	sort.Slice(ready, func(i, j int) bool { return ready[i].RequestedAt.After(ready[j].RequestedAt) })
+	if len(ready) > n {
+		ready = ready[:n]
+	}
+	return ready, nil
+}
+
+// Request registers a repo if unknown and enqueues it if new or stale.
+// It never blocks on git operations.
+func (s *Service) Request(ctx context.Context, host, owner, name string) (*model.Repo, error) {
+	id, err := model.RepoID(host, owner, name)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	repo, err := s.update(ctx, id, func(r *model.Repo) error {
+		if r.Host == "" { // new
+			r.Host = strings.ToLower(host)
+			r.Owner = owner
+			r.Name = name
+			r.Status = model.StatusPending
+			r.CreatedAt = now
+		}
+		// Avoid rewriting the file on every image hit: only bump every minute.
+		if now.Sub(r.RequestedAt) > time.Minute {
+			r.RequestedAt = now
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	switch repo.Status {
+	case model.StatusTooBig:
+		// waits for a manual baseline, see notifyTooBig
+	case model.StatusPending:
+		s.Enqueue(id)
+	default:
+		if now.Sub(repo.CheckedAt) > s.opts.RefreshInterval {
+			s.Enqueue(id)
+		}
+	}
+	return repo, nil
+}
+
+// Enqueue puts a repo in the front queue (deduplicated).
+func (s *Service) Enqueue(id string) {
+	s.mu.Lock()
+	if !s.queued[id] && !s.working[id] {
+		s.queued[id] = true
+		s.queue = append(s.queue, id)
+	}
+	s.mu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Run starts the workers and blocks until ctx is done.
+func (s *Service) Run(ctx context.Context) {
+	s.recoverInterrupted(ctx)
+
+	var wg sync.WaitGroup
+	for i := 0; i < s.opts.Workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.worker(ctx)
+		}()
+	}
+	wg.Wait()
+}
+
+// recoverInterrupted re-enqueues repos that were being processed when the
+// process died.
+func (s *Service) recoverInterrupted(ctx context.Context) {
+	all, err := s.repos.List(ctx)
+	if err != nil {
+		log.Println("recover:", err)
+		return
+	}
+	for _, r := range all {
+		if r.Status == model.StatusProcessing || r.Status == model.StatusPending {
+			s.Enqueue(r.Id.Id)
+		}
+	}
+}
+
+func (s *Service) worker(ctx context.Context) {
+	for {
+		id := s.next(ctx)
+		if id == "" {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.wake:
+			case <-time.After(30 * time.Second):
+			}
+			continue
+		}
+
+		s.process(ctx, id)
+
+		s.mu.Lock()
+		delete(s.working, id)
+		delete(s.progress, id)
+		s.mu.Unlock()
+	}
+}
+
+// next pops the front queue or, if empty, the stalest known repo.
+func (s *Service) next(ctx context.Context) string {
+	s.mu.Lock()
+	for len(s.queue) > 0 {
+		id := s.queue[0]
+		s.queue = s.queue[1:]
+		delete(s.queued, id)
+		if s.working[id] {
+			continue
+		}
+		s.working[id] = true
+		s.mu.Unlock()
+		return id
+	}
+	s.mu.Unlock()
+
+	all, err := s.repos.List(ctx)
+	if err != nil {
+		log.Println("list repos:", err)
+		return ""
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].CheckedAt.Before(all[j].CheckedAt) })
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range all {
+		if r.Status == model.StatusTooBig || r.Status == model.StatusNotFound {
+			continue
+		}
+		if time.Since(r.CheckedAt) < s.opts.RefreshInterval {
+			break // sorted: the rest are fresher
+		}
+		if s.working[r.Id.Id] {
+			continue
+		}
+		s.working[r.Id.Id] = true
+		return r.Id.Id
+	}
+	return ""
+}
+
+func (s *Service) setProgress(id string, p Progress) {
+	s.mu.Lock()
+	s.progress[id] = p
+	s.mu.Unlock()
+}
+
+func (s *Service) process(parent context.Context, id string) {
+	ctx, cancel := context.WithTimeout(parent, s.opts.AnalyzeTimeout)
+	defer cancel()
+
+	started := time.Now()
+	err := s.processRepo(ctx, id)
+	if err != nil {
+		log.Printf("repo %s: %v (%s)", id, err, time.Since(started).Round(time.Millisecond))
+		_, uerr := s.update(parent, id, func(r *model.Repo) error {
+			r.CheckedAt = time.Now()
+			if errors.Is(err, githost.ErrNotFound) {
+				r.Status = model.StatusNotFound
+				r.Error = ""
+				return nil
+			}
+			r.Status = model.StatusError
+			r.Error = err.Error()
+			return nil
+		})
+		if uerr != nil {
+			log.Printf("repo %s: saving error: %v", id, uerr)
+		}
+		return
+	}
+	log.Printf("repo %s: done (%s)", id, time.Since(started).Round(time.Millisecond))
+}
+
+func (s *Service) processRepo(ctx context.Context, id string) error {
+	repo, err := s.repos.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if repo == nil {
+		return fmt.Errorf("repo disappeared")
+	}
+
+	info, err := s.host.Info(ctx, repo.Owner, repo.Name)
+	if err != nil {
+		return err
+	}
+
+	repo, err = s.update(ctx, id, func(r *model.Repo) error {
+		r.Owner = info.Owner
+		r.Name = info.Name
+		r.DefaultBranch = info.DefaultBranch
+		r.SizeKB = info.SizeKB
+		if s.opts.MaxRepoSizeKB > 0 && info.SizeKB > s.opts.MaxRepoSizeKB && r.HeadCommit == "" {
+			r.Status = model.StatusTooBig
+		} else if r.Status != model.StatusReady {
+			r.Status = model.StatusProcessing
+		}
+		r.Error = ""
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if repo.Status == model.StatusTooBig {
+		s.notifyTooBig(repo)
+		_, err = s.update(ctx, id, func(r *model.Repo) error { r.CheckedAt = time.Now(); return nil })
+		return err
+	}
+
+	s.setProgress(id, Progress{Phase: "sync"})
+	head, err := s.analyzer.Sync(ctx, id, repo.CloneURL(), repo.DefaultBranch)
+	if err != nil {
+		return fmt.Errorf("sync: %w", err)
+	}
+
+	if head == repo.HeadCommit && repo.Status == model.StatusReady {
+		_, err = s.update(ctx, id, func(r *model.Repo) error { r.CheckedAt = time.Now(); return nil })
+		return err
+	}
+
+	prev, err := s.Series(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	s.setProgress(id, Progress{Phase: "analyze"})
+	points, err := s.analyzer.Analyze(ctx, id, head, prev, func(done, total int) {
+		s.setProgress(id, Progress{Phase: "analyze", Done: done, Total: total})
+	})
+	if err != nil {
+		return fmt.Errorf("analyze: %w", err)
+	}
+
+	if err := s.putSeries(ctx, id, points); err != nil {
+		return err
+	}
+
+	now := time.Now()
+	_, err = s.update(ctx, id, func(r *model.Repo) error {
+		r.Status = model.StatusReady
+		r.Error = ""
+		r.HeadCommit = head
+		r.Commits = len(points)
+		r.Latest = nil
+		if len(points) > 0 {
+			r.Latest = points[len(points)-1].Languages
+		}
+		r.CheckedAt = now
+		r.UpdatedAt = now
+		return nil
+	})
+	return err
+}
+
+func (s *Service) putSeries(ctx context.Context, id string, points []model.Point) error {
+	ser, err := s.series.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if ser == nil {
+		ser = &model.Series{Id: store.NewId(id)}
+	}
+	ser.Points = points
+	return s.series.Put(ctx, ser)
+}
+
+func (s *Service) notifyTooBig(r *model.Repo) {
+	s.tg.Send(fmt.Sprintf("cloc: repo too big to analyze automatically: %s (%d MB, limit %d MB)\n%s/%s",
+		r.Slug(), r.SizeKB/1024, s.opts.MaxRepoSizeKB/1024, s.opts.BaseURL, r.Slug()))
+}
+
+// update does a serialized read-modify-write of a repo document, creating it
+// if it does not exist.
+func (s *Service) update(ctx context.Context, id string, fn func(r *model.Repo) error) (*model.Repo, error) {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	r, err := s.repos.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if r == nil {
+		r = &model.Repo{Id: store.NewId(id)}
+	}
+	if err := fn(r); err != nil {
+		return nil, err
+	}
+	if err := s.repos.Put(ctx, r); err != nil {
+		return nil, err
+	}
+	return r, nil
+}

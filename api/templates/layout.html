@@ -1,0 +1,28 @@
+{{define "head"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.}}</title>
+  <link rel="stylesheet" href="/static/vendor/pico.min.css">
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul><li><a href="/" class="brand"><img src="/static/favicon.svg" alt="" width="22" height="22"> <strong>cloc</strong>.hola.cloud</a></li></ul>
+      <ul><li><a href="https://github.com/holacloud/clocme" class="secondary">GitHub</a></li></ul>
+    </nav>
+  </header>
+  <main class="container">
+{{end}}
+
+{{define "foot"}}
+  </main>
+  <footer class="container">
+    <small>Lines of code over time for your README. Counted with <a href="https://github.com/boyter/scc">scc</a>, vendored and generated files excluded following GitHub Linguist rules.</small>
+  </footer>
+</body>
+</html>
+{{end}}

@@ -1,0 +1,104 @@
+{{template "head" (print .Repo.Owner "/" .Repo.Name " · lines of code · cloc.hola.cloud")}}
+
+<hgroup>
+  <h1><a href="https://{{.Slug}}" class="contrast">{{.Repo.Owner}}/<strong>{{.Repo.Name}}</strong></a></h1>
+  <p>
+    {{if .Repo.HeadCommit}}
+      {{.Repo.Commits}} commits on <code>{{.Repo.DefaultBranch}}</code> ·
+      {{compact .Total.Code}} lines of code ·
+      updated {{since .Repo.UpdatedAt}}
+    {{else}}
+      Not analyzed yet
+    {{end}}
+  </p>
+</hgroup>
+
+<div id="app" data-config="{{.OptsJSON}}">
+  <article class="chart-card">
+    <div v-if="status === 'pending' || status === 'processing'" class="progress-box" v-cloak>
+      <p aria-busy="true">${ progressText }</p>
+      <progress v-if="progress && progress.total" :value="progress.done" :max="progress.total"></progress>
+    </div>
+    <img :src="imageSrc" src="/{{.Slug}}.svg{{with .Options.Query.Encode}}?{{.}}{{end}}" alt="Lines of code of {{.Repo.Owner}}/{{.Repo.Name}}" class="chart">
+  </article>
+
+  <details class="options" open>
+    <summary>Customize</summary>
+    <div class="grid">
+      <label>Languages
+        <select v-model="opts.top">
+          <option value="3">Top 3</option>
+          <option value="5">Top 5</option>
+          <option value="8">Top 8</option>
+          <option value="12">Top 12</option>
+          <option value="0">All</option>
+        </select>
+      </label>
+      <label>X axis
+        <select v-model="opts.x">
+          <option value="date">Date</option>
+          <option value="commits">Commits</option>
+        </select>
+      </label>
+      <label>Mode
+        <select v-model="opts.mode">
+          <option value="stacked">Stacked</option>
+          <option value="percent">Percent</option>
+          <option value="lines">Lines</option>
+        </select>
+      </label>
+      <label>Metric
+        <select v-model="opts.metric">
+          <option value="code">Code</option>
+          <option value="lines">All lines</option>
+          <option value="comments">Comments</option>
+          <option value="files">Files</option>
+        </select>
+      </label>
+      <label>Theme
+        <select v-model="opts.theme">
+          <option value="auto">Auto</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </label>
+    </div>
+    <label>Exclude languages <small>(comma separated)</small>
+      <input type="text" v-model.lazy="opts.exclude" placeholder="e.g. HTML, CSS">
+    </label>
+  </details>
+
+  <h3>Embed it</h3>
+  <div class="snippet">
+    <pre><code>${ markdown }</code></pre>
+    <button class="outline" @click="copy">${ copied ? 'Copied!' : 'Copy markdown' }</button>
+  </div>
+</div>
+
+{{if .Languages}}
+<h3>Languages at <code>{{slice .Repo.HeadCommit 0 7}}</code></h3>
+<div class="overflow-auto">
+<table class="striped">
+  <thead><tr><th>Language</th><th>Files</th><th>Code</th><th>Comments</th><th>Blanks</th><th>%</th></tr></thead>
+  <tbody>
+  {{range .Languages}}
+    <tr{{if .Data}} class="muted"{{end}}>
+      <td>{{.Name}}{{if .Data}} <small>(data, hidden by default)</small>{{end}}</td>
+      <td>{{.Stats.Files}}</td>
+      <td>{{.Stats.Code}}</td>
+      <td>{{.Stats.Comments}}</td>
+      <td>{{.Stats.Blanks}}</td>
+      <td>{{if not .Data}}{{printf "%.1f" .Percent}}{{end}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
+
+{{if eq .Repo.Status "error"}}<p class="error">Last analysis failed: {{.Repo.Error}}</p>{{end}}
+
+<script src="/static/vendor/vue.global.prod.js"></script>
+<script src="/static/app.js"></script>
+
+{{template "foot"}}

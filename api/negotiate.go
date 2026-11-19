@@ -1,0 +1,46 @@
+package api
+
+import (
+	"net/http"
+	"strings"
+)
+
+const (
+	FormatHTML = "html"
+	FormatSVG  = "svg"
+	FormatJSON = "json"
+)
+
+// splitFormat removes a known extension from the repo segment:
+// "box.svg" -> ("box", "svg"). Repo names may legitimately contain dots
+// ("socket.io"), so only exact known extensions are stripped.
+func splitFormat(name string) (string, string) {
+	for _, f := range []string{FormatSVG, FormatJSON} {
+		if strings.HasSuffix(name, "."+f) && len(name) > len(f)+1 {
+			return strings.TrimSuffix(name, "."+f), f
+		}
+	}
+	return name, ""
+}
+
+// negotiate decides what to answer for a repo URL. Priority:
+//  1. explicit ?format= or extension (escape hatch if our guesses are wrong)
+//  2. a browser navigating to the page: Accept has text/html and
+//     Sec-Fetch-Dest is "document" (or absent, older clients) -> HTML
+//  3. anything else (<img>, GitHub camo proxy, curl...) -> SVG
+func negotiate(r *http.Request, ext string) string {
+	switch f := strings.ToLower(r.URL.Query().Get("format")); f {
+	case FormatHTML, FormatSVG, FormatJSON:
+		return f
+	}
+	if ext != "" {
+		return ext
+	}
+
+	accept := r.Header.Get("Accept")
+	dest := r.Header.Get("Sec-Fetch-Dest")
+	if strings.Contains(accept, "text/html") && (dest == "" || dest == "document") {
+		return FormatHTML
+	}
+	return FormatSVG
+}

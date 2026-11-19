@@ -1,0 +1,31 @@
+{{template "head" "cloc.hola.cloud · lines of code history for your README"}}
+
+<section class="hero">
+  <h1>How has your code grown?</h1>
+  <p>Paste a public GitHub repository and get a chart of its lines of code, per language, commit after commit. Embed it in your README with one line.</p>
+
+  <form action="/go" method="get" role="search">
+    <input type="search" name="repo" value="{{.Input}}" placeholder="github.com/owner/repo" aria-label="Repository" required autofocus {{if .Error}}aria-invalid="true"{{end}}>
+    <input type="submit" value="Chart it">
+  </form>
+  {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+
+  <p><small>Or just use the URL directly:</small></p>
+  <pre><code>![Lines of code]({{.BaseURL}}/github.com/owner/repo)</code></pre>
+</section>
+
+{{if .Recent}}
+<section>
+  <h2>Recently charted</h2>
+  <div class="grid-cards">
+    {{range .Recent}}
+    <a class="card" href="/{{.Slug}}">
+      <img src="/{{.Slug}}.svg?title=0&legend=0&w=400&h=200" alt="Lines of code of {{.Owner}}/{{.Name}}" loading="lazy" width="400" height="200">
+      <span>{{.Owner}}/<strong>{{.Name}}</strong></span>
+    </a>
+    {{end}}
+  </div>
+</section>
+{{end}}
+
+{{template "foot"}}
